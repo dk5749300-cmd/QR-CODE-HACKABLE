@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # DANIYAL KHAN - Professional Android Pentesting Framework
-# Author: DANIYAL KHAN | @hexsecteam | v10.1.0 PRO
-# QR Pairing Integration
+# Author: DANIYAL KHAN | @hexsecteam | v11.0.0 PRO
+# Termux + QR-in-Browser Edition
 
 import os, sys, re, io, json, time, base64, hashlib, zipfile, shutil, socket, platform
 import threading, subprocess, webbrowser, concurrent.futures
@@ -22,19 +22,28 @@ def _ensure(pkg, name):
         return False
 
 _ensure("flask", "Flask")
+_ensure("qrcode", "qrcode[pil]")
+_ensure("zeroconf", "zeroconf")
 
 from flask import Flask, request, jsonify, Response
+import qrcode
+from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
 
-VERSION = "10.1.0"
+VERSION = "11.0.0"
 AUTHOR = "DANIYAL KHAN"
 INSTAGRAM = "@hexsecteam"
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"   # listen on all so phone can reach it
 PORT = 5000
 SYSTEM = platform.system()
+IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "") or os.path.exists("/data/data/com.termux")
 BASE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(BASE, "output")
 for d in ("reports", "screenshots", "payloads", "logs"):
     os.makedirs(os.path.join(OUT, d), exist_ok=True)
+
+# Termux tmp dir
+TMP = os.environ.get("TMPDIR", os.path.join(BASE, "tmp"))
+os.makedirs(TMP, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CORE HELPERS
@@ -85,6 +94,8 @@ def device_info(d):
     return {k: (adb(["shell", f"getprop {v}"], d)[0] or "N/A") for k, v in keys.items()}
 
 def device_ip(d):
+    if IS_TERMUX:
+        return "127.0.0.1"
     out, _ = adb(["shell", "ip addr show wlan0"], d)
     m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", out or "")
     if m:
@@ -154,42 +165,23 @@ def usb_to_wifi(port=5555):
     return {"success": ok, "output": f"tcpip: {out1}\nconnect: {out2}", "ip": ip, "port": port}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  QR PAIRING (from first tool)
+#  QR PAIRING — BUILT-IN (no external tool needed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def find_qr_tool():
-    found = shutil.which("adb-wifi-qr")
-    if found: return found
-    py = Path(sys.executable).parent
-    cands = [
-        py / "Scripts" / "adb-wifi-qr.exe",
-        py / "Scripts" / "adb-wifi-qr",
-        py / "adb-wifi-qr",
-        Path(sys.executable).parent.parent / "bin" / "adb-wifi-qr",
-    ]
-    if os.name == "nt":
-        for base in (os.environ.get("LOCALAPPDATA", ""),
-                     os.environ.get("APPDATA", "")):
-            if base:
-                for v in ("Python314", "Python313", "Python312", "Python311"):
-                    cands.append(Path(base) / "Python" / v / "Scripts" / "adb-wifi-qr.exe")
-    # Also check the venv path pattern from this project
-    try:
-        venv_bin = Path(BASE) / ".venv" / "bin" / "adb-wifi-qr"
-        cands.append(venv_bin)
-        venv_scripts = Path(BASE) / ".venv" / "Scripts" / "adb-wifi-qr.exe"
-        cands.append(venv_scripts)
-    except Exception:
-        pass
-    for c in cands:
-        try:
-            if c.exists(): return str(c)
-        except Exception:
-            continue
-    return None
+# Session state for QR pairing
+_QR = {
+    "active": False,
+    "service_name": None,
+    "password": None,
+    "qr_base64": None,
+    "paired": False,
+    "paired_device": None,
+    "error": None,
+    "started_at": 0,
+}
 
-def fix_mdns():
-    """Repair adb mdns service. Uses adb() from THIS tool which returns (stdout, rc)."""
+def _fix_mdns():
+    """Repair adb mdns service."""
     os.environ["ADB_MDNS_OPENSCREEN"] = "1"
     adb(["kill-server"])
     adb(["kill-server"])
@@ -201,50 +193,170 @@ def fix_mdns():
     ok = rc == 0 and "unknown host service" not in c and "error" not in c
     return ok, (out or "ready")
 
-def open_qr_terminal():
-    """Open a new terminal window running adb-wifi-qr --connect"""
-    qr_tool = find_qr_tool()
-    if not qr_tool:
-        return False, "adb-wifi-qr not found. Install: pip install adb-wifi-qr"
+def _make_qr_image(payload):
+    """Generate QR PNG as base64 data URL."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=8,
+        border=2,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
-    if os.name == "nt":
-        # Windows: new cmd window
-        cmd = f'start "DANIYAL KHAN - QR PAIRING" cmd /k ""{qr_tool}" --connect --timeout 180"'
+class _PairingListener(ServiceListener):
+    """Listens for the phone's _adb-tls-pairing._tcp.local. broadcast."""
+    def __init__(self):
+        super().__init__()
+        self.found_port = None
+        self.found_address = None
+        self.lock = threading.Lock()
+
+    def update_service(self, zc, type_, name):
+        pass
+
+    def remove_service(self, zc, type_, name):
+        pass
+
+    def add_service(self, zc, type_, name):
         try:
-            subprocess.Popen(cmd, shell=True)
-            return True, "QR terminal opened"
+            info = zc.get_service_info(type_, name)
+            if not info:
+                return
+            with self.lock:
+                if self.found_port:
+                    return
+                self.found_port = info.port
+                if info.addresses:
+                    self.found_address = socket.inet_ntoa(info.addresses[0])
+                else:
+                    self.found_address = "127.0.0.1"
+                print(f"[QR] Phone advertised: {self.found_address}:{self.found_port}")
         except Exception as e:
-            return False, str(e)
-    elif SYSTEM == "Darwin":
-        # macOS: new Terminal window
-        script = f'tell application "Terminal" to do script "{qr_tool} --connect --timeout 180"'
+            print(f"[QR] add_service error: {e}")
+
+
+def start_qr_pairing_session():
+    """Generate QR + start mDNS listener + auto-pair when phone appears."""
+    # Reset
+    _QR.update({
+        "active": True, "paired": False, "paired_device": None,
+        "error": None, "started_at": time.time(),
+    })
+
+    # Generate credentials — same format as adb-wifi-qr
+    import secrets
+    service_name = "adb-" + secrets.token_hex(6)
+    password = secrets.token_urlsafe(12)[:12]
+    _QR["service_name"] = service_name
+    _QR["password"] = password
+
+    # QR payload format used by Android wireless debugging
+    payload = f"WIFI:T:ADB;S:{service_name};P:{password};;"
+    _QR["qr_base64"] = _make_qr_image(payload)
+
+    # Repair mdns in background
+    threading.Thread(target=_fix_mdns, daemon=True).start()
+
+    # Start pairing worker in background
+    threading.Thread(
+        target=_qr_pairing_worker,
+        args=(service_name, password),
+        daemon=True
+    ).start()
+
+    return True
+
+
+def _qr_pairing_worker(service_name, password):
+    """Listen for phone mDNS broadcast, then run adb pair."""
+    zc = None
+    browser = None
+    listener = _PairingListener()
+    try:
+        zc = Zeroconf()
+        browser = ServiceBrowser(zc, "_adb-tls-pairing._tcp.local.", listener)
+
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if listener.found_port:
+                break
+            if not _QR["active"]:
+                return
+            time.sleep(0.5)
+
+        if not listener.found_port:
+            _QR["error"] = "No phone detected — scan the QR within 180s"
+            _QR["active"] = False
+            return
+
+        # Run adb pair
+        addr = listener.found_address or "127.0.0.1"
+        port = listener.found_port
+        print(f"[QR] Running: adb pair {addr}:{port} with password")
+
         try:
-            subprocess.Popen(["osascript", "-e", script])
-            return True, "QR terminal opened"
+            p = subprocess.Popen(
+                ["adb", "pair", f"{addr}:{port}"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True
+            )
+            out, _ = p.communicate(input=password + "\n", timeout=30)
+            print(f"[QR] Pair output: {out}")
+
+            # Known ARM64 bug: retry once
+            if "Successfully paired" not in out and "already paired" not in out.lower():
+                print("[QR] Retrying pair (known bug)...")
+                p2 = subprocess.Popen(
+                    ["adb", "pair", f"{addr}:{port}"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True
+                )
+                out2, _ = p2.communicate(input=password + "\n", timeout=30)
+                out = out + "\n" + out2
+                print(f"[QR] Retry output: {out2}")
+
+            if "Successfully paired" in out or "already paired" in out.lower():
+                _QR["paired"] = True
+                _QR["active"] = False
+                # Auto-connect if we get the connection port from mdns
+                # (Android usually auto-connects after pairing, so just check)
+                time.sleep(2)
+                devs = list_devices()
+                if devs:
+                    _QR["paired_device"] = devs[0]["serial"]
+                    print(f"[QR] Device connected: {devs[0]['serial']}")
+                else:
+                    # Try connecting to common ports
+                    for try_port in [5555, port + 1, port]:
+                        r = do_connect(addr, try_port)
+                        if r["success"]:
+                            devs = list_devices()
+                            if devs:
+                                _QR["paired_device"] = devs[0]["serial"]
+                                break
+            else:
+                _QR["error"] = out.strip()[-200:]
+                _QR["active"] = False
         except Exception as e:
-            return False, str(e)
-    else:
-        # Linux: try common terminal emulators
-        # Wrap in a bash shell so window stays open after exit
-        shell_cmd = f'"{qr_tool}" --connect --timeout 180; echo; echo "Press Enter to close..."; read'
-        terminals = [
-            ["x-terminal-emulator", "-e", f"bash -c '{shell_cmd}'"],
-            ["gnome-terminal", "--", "bash", "-c", shell_cmd],
-            ["konsole", "-e", "bash", "-c", shell_cmd],
-            ["xfce4-terminal", "-e", f"bash -c '{shell_cmd}'"],
-            ["mate-terminal", "-e", f"bash -c '{shell_cmd}'"],
-            ["lxterminal", "-e", f"bash -c '{shell_cmd}'"],
-            ["tilix", "-e", "bash", "-c", shell_cmd],
-            ["xterm", "-e", "bash", "-c", shell_cmd],
-        ]
-        for term in terminals:
-            if shutil.which(term[0]):
-                try:
-                    subprocess.Popen(term)
-                    return True, f"QR terminal opened ({term[0]})"
-                except Exception:
-                    continue
-        return False, "No terminal emulator found. Install: sudo apt install xterm"
+            _QR["error"] = str(e)
+            _QR["active"] = False
+    except Exception as e:
+        _QR["error"] = str(e)
+        _QR["active"] = False
+    finally:
+        try:
+            if browser: browser.cancel()
+        except Exception: pass
+        try:
+            if zc: zc.close()
+        except Exception: pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  APK ANALYZER
@@ -462,11 +574,17 @@ footer{{text-align:center;color:#5a6b82;margin-top:30px;font-family:monospace;fo
 
 app = Flask(__name__)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HTML - Responsive Desktop + Mobile with In-Browser QR
+# ═══════════════════════════════════════════════════════════════════════════════
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#05080f">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>DANIYAL KHAN PRO</title>
 <style>
 :root {
@@ -476,21 +594,26 @@ HTML = r"""<!DOCTYPE html>
   --text:#e0e8f0; --text2:#a0b0c8; --dim:#5a6b82;
   --console-bg:#020408; --console-fg:#00ff9f;
 }
-* { margin:0; padding:0; box-sizing:border-box; }
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
 html, body { width:100%; height:100%; overflow:hidden; }
 body {
-  font-family: 'Segoe UI', Roboto, system-ui, sans-serif;
+  font-family: 'Segoe UI', Roboto, system-ui, -apple-system, sans-serif;
   background: var(--bg); color: var(--text);
   background-image:
     radial-gradient(ellipse at 15% 20%, rgba(0,212,255,.08) 0%, transparent 40%),
     radial-gradient(ellipse at 85% 80%, rgba(139,92,246,.06) 0%, transparent 40%);
+  -webkit-font-smoothing: antialiased;
 }
-.app { display:flex; height:100vh; }
+
+/* ══════════════ DESKTOP LAYOUT ══════════════ */
+.app { display:flex; height:100vh; height:100dvh; }
 
 .sidebar {
   width:260px; background:var(--panel);
   border-right:1px solid var(--border);
   display:flex; flex-direction:column; flex-shrink:0;
+  transition:transform .3s ease;
+  z-index:100;
 }
 .sidebar-header {
   padding:20px; border-bottom:1px solid var(--border);
@@ -498,7 +621,7 @@ body {
   background:linear-gradient(135deg, rgba(0,212,255,.05), rgba(139,92,246,.03));
 }
 .logo {
-  width:44px; height:44px; border-radius:10px;
+  width:44px; height:44px; border-radius:10px; flex-shrink:0;
   background:linear-gradient(135deg, var(--accent), var(--accent2));
   display:flex; align-items:center; justify-content:center;
   font-weight:800; font-size:22px; color:var(--bg);
@@ -509,7 +632,7 @@ body {
 
 .nav { flex:1; overflow-y:auto; padding:8px 0; }
 .nav-item {
-  padding:11px 20px; color:var(--text2); font-size:13px;
+  padding:12px 20px; color:var(--text2); font-size:13px;
   cursor:pointer; border-left:3px solid transparent;
   transition:all .15s; display:flex; align-items:center; gap:10px;
 }
@@ -529,7 +652,7 @@ body {
   animation:pulse 2s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-.main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+.main { flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
 .header {
   display:flex; justify-content:space-between; align-items:center;
   padding:16px 24px; background:var(--panel);
@@ -541,6 +664,7 @@ body {
   display:flex; gap:8px; align-items:center;
   background:var(--hover); padding:8px 12px;
   border-radius:8px; border:1px solid var(--border);
+  flex-wrap:wrap;
 }
 .device-bar select {
   background:var(--bg); color:var(--accent);
@@ -554,7 +678,9 @@ body {
   background:var(--hover); color:var(--text); font-size:12px; font-weight:600;
   cursor:pointer; transition:all .2s; font-family:inherit;
   display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+  user-select:none;
 }
+.btn:active { transform:scale(.97); }
 .btn:hover { border-color:var(--accent); color:var(--accent); background:rgba(0,212,255,.08); }
 .btn.primary {
   background:linear-gradient(135deg, rgba(0,212,255,.2), rgba(139,92,246,.1));
@@ -568,8 +694,10 @@ body {
   box-shadow:0 0 15px rgba(139,92,246,.3);
 }
 .btn.qr:hover { box-shadow:0 0 25px rgba(139,92,246,.5); color:#ddd6fe; }
+.btn.danger { border-color:var(--danger); color:var(--danger); }
+.btn:disabled { opacity:.5; cursor:not-allowed; }
 
-.content { flex:1; overflow-y:auto; padding:20px 24px; }
+.content { flex:1; overflow-y:auto; padding:20px 24px; -webkit-overflow-scrolling:touch; }
 .card {
   background:var(--panel); border:1px solid var(--border);
   border-radius:10px; padding:20px; margin-bottom:16px;
@@ -595,6 +723,7 @@ body {
 .fg input::placeholder { color:var(--dim); }
 
 .btn-group { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+.btn-group .btn { flex:1; justify-content:center; }
 
 .output {
   background:var(--console-bg); border:1px solid var(--border);
@@ -622,10 +751,31 @@ body {
 .stat-lbl { font-size:10px; color:var(--dim);
   text-transform:uppercase; letter-spacing:1.2px; }
 
+/* ══════════════ QR DISPLAY ══════════════ */
+.qr-wrapper {
+  display:flex; flex-direction:column; align-items:center;
+  padding:20px; background:white; border-radius:14px;
+  margin:16px auto; max-width:320px;
+  box-shadow:0 0 40px rgba(0,212,255,.3);
+}
+.qr-wrapper img {
+  width:100%; max-width:280px; height:auto; display:block;
+  border-radius:6px;
+}
+.qr-instructions {
+  color:#0a1018; font-size:12px; text-align:center;
+  margin-top:12px; font-weight:600; line-height:1.5;
+}
+.qr-payload {
+  color:#666; font-size:10px; font-family:monospace;
+  margin-top:6px; word-break:break-all;
+}
+
 .qr-status {
   padding:14px 16px; border-radius:8px; margin-top:12px;
   font-size:13px; display:flex; align-items:center; gap:10px;
   border:1px solid var(--border); background:var(--hover);
+  justify-content:center;
 }
 .qr-status.waiting { border-color:var(--warn); color:var(--warn); }
 .qr-status.success { border-color:var(--success); color:var(--success); }
@@ -633,7 +783,7 @@ body {
 .qr-status .spinner {
   width:16px; height:16px; border:2px solid transparent;
   border-top-color:currentColor; border-radius:50%;
-  animation:spin 1s linear infinite;
+  animation:spin 1s linear infinite; flex-shrink:0;
 }
 @keyframes spin { to { transform:rotate(360deg); } }
 
@@ -665,20 +815,82 @@ body {
   border-radius:4px;
 }
 
-@media (max-width:900px) {
-  .sidebar { width:200px; }
-  .device-bar select { min-width:130px; }
+/* ══════════════ MOBILE TOP BAR (hidden on desktop) ══════════════ */
+.mobile-topbar {
+  display:none; padding:12px 16px;
+  background:var(--panel); border-bottom:1px solid var(--border);
+  align-items:center; justify-content:space-between; gap:12px;
+}
+.mobile-topbar .menu-btn {
+  width:40px; height:40px; border-radius:8px;
+  background:var(--hover); border:1px solid var(--border);
+  color:var(--accent); font-size:20px; cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+}
+.mobile-topbar .title {
+  font-size:13px; font-weight:700; color:var(--accent); letter-spacing:1.5px;
+  flex:1; text-align:center;
+}
+.mobile-topbar .status-dot {
+  width:10px; height:10px; border-radius:50%; background:var(--success);
+  box-shadow:0 0 10px currentColor;
+}
+
+.overlay {
+  display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
+  z-index:99; backdrop-filter:blur(2px);
+}
+.overlay.active { display:block; }
+
+/* ══════════════ MOBILE RESPONSIVE ══════════════ */
+@media (max-width: 900px) {
+  .sidebar {
+    position:fixed; left:0; top:0; bottom:0;
+    transform:translateX(-100%);
+    width:260px;
+  }
+  .sidebar.open { transform:translateX(0); }
+  .mobile-topbar { display:flex; }
+  .header { padding:12px 16px; flex-direction:column; align-items:stretch; gap:10px; }
+  .header h1 { font-size:16px; }
+  .device-bar { width:100%; }
+  .device-bar select { min-width:0; flex:1; font-size:11px; }
+  .device-bar .btn { padding:7px 10px; font-size:11px; }
+  .content { padding:14px 12px; }
+  .card { padding:16px; margin-bottom:12px; }
+  .card h3 { font-size:11px; }
+  .stat-grid { grid-template-columns:repeat(2, 1fr); gap:8px; }
+  .stat { padding:12px 8px; }
+  .stat-val { font-size:20px; }
+  .stat-lbl { font-size:9px; }
+  .console { height:130px; }
+  .console-hdr { padding:6px 12px; font-size:10px; }
+  .console-body { padding:6px 12px; font-size:10px; }
+  .btn-group { flex-direction:column; }
+  .btn-group .btn { width:100%; padding:12px; font-size:13px; }
+  .qr-wrapper { max-width:280px; padding:14px; }
+  .qr-wrapper img { max-width:240px; }
+  #devInd { display:none; }
+}
+
+@media (max-width: 400px) {
+  .mobile-topbar .title { font-size:11px; }
+  .header h1 { font-size:15px; }
+  .stat-val { font-size:18px; }
 }
 </style>
 </head>
 <body>
+
+<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
+
 <div class="app">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
       <div class="logo">D</div>
       <div class="logo-text">
         <h2>DANIYAL KHAN</h2>
-        <p>PRO v10.1.0</p>
+        <p>PRO v11.0.0</p>
       </div>
     </div>
     <nav class="nav" id="nav"></nav>
@@ -689,6 +901,12 @@ body {
   </aside>
 
   <main class="main">
+    <div class="mobile-topbar">
+      <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+      <div class="title">DANIYAL KHAN PRO</div>
+      <div class="status-dot" id="mobStatusDot"></div>
+    </div>
+
     <header class="header">
       <div>
         <h1 id="pageTitle">Dashboard</h1>
@@ -720,6 +938,7 @@ var curDev = null;
 var curView = 'dashboard';
 var devs = [];
 var qrPollTimer = null;
+var isMobile = window.matchMedia('(max-width: 900px)').matches;
 
 var VIEWS = [
   ['dashboard',  'Dashboard'],
@@ -738,6 +957,13 @@ var VIEWS = [
   ['remote',     'Remote Control'],
   ['about',      'About']
 ];
+
+function toggleSidebar() {
+  var sb = document.getElementById('sidebar');
+  var ov = document.getElementById('overlay');
+  sb.classList.toggle('open');
+  ov.classList.toggle('active');
+}
 
 function log(msg, type) {
   type = type || 'info';
@@ -777,7 +1003,7 @@ function buildNav() {
       var item = document.createElement('div');
       item.className = 'nav-item' + (v[0] === curView ? ' active' : '');
       item.textContent = v[1];
-      item.onclick = function() { showView(v[0]); };
+      item.onclick = function() { showView(v[0]); if (isMobile) toggleSidebar(); };
       nav.appendChild(item);
     })(VIEWS[i]);
   }
@@ -846,12 +1072,12 @@ var views = {};
 views.dashboard = function(c) {
   var html = '<div class="card">' +
     '<h3>Dashboard</h3>' +
-    '<p>Professional Android Pentesting Framework v10.1.0<br>' +
+    '<p>Professional Android Pentesting Framework v11.0.0<br>' +
     '<strong style="color:var(--accent)">Go to Connect Device to begin your assessment.</strong></p>' +
     '</div>';
   html += '<div class="stat-grid">' +
     '<div class="stat"><div class="stat-val">15</div><div class="stat-lbl">Modules</div></div>' +
-    '<div class="stat"><div class="stat-val">10.1</div><div class="stat-lbl">Version</div></div>' +
+    '<div class="stat"><div class="stat-val">11.0</div><div class="stat-lbl">Version</div></div>' +
     '<div class="stat"><div class="stat-val" id="findCount">0</div><div class="stat-lbl">Findings</div></div>' +
     '<div class="stat"><div class="stat-val" id="devCount">0</div><div class="stat-lbl">Devices</div></div>' +
     '</div>';
@@ -872,17 +1098,17 @@ async function refreshStats() {
 views.connect = function(c) {
   var html = '<div class="card" style="border-color:var(--accent2);box-shadow:0 0 25px rgba(139,92,246,.15)">' +
     '<h3 style="color:var(--accent2)">⚡ Method 1 — QR Code Pairing (Recommended)</h3>' +
-    '<p>Click below. A new terminal window will open showing a QR code.<br>' +
+    '<p>Click the button below. A QR code will appear <strong>right here</strong>.<br>' +
     'On your phone: <strong>Settings → Developer Options → Wireless Debugging → Pair device with QR code</strong><br>' +
-    'Scan the QR code with your phone — it will pair and connect automatically.</p>' +
-    '<div class="btn-group"><button class="btn qr" onclick="doQRPair()" style="flex:1;padding:14px;font-size:14px">📱 Open QR Pairing Terminal</button></div>' +
-    '<div id="qrStatusBox"></div>' +
+    'Then scan the QR shown below.</p>' +
+    '<div class="btn-group"><button class="btn qr" id="qrStartBtn" onclick="doQRPair()">📱 Generate QR Code</button></div>' +
+    '<div id="qrContainer"></div>' +
     '</div>';
 
   html += '<div class="card">' +
     '<h3>Method 2 — USB to Wireless</h3>' +
     '<p>Plug the phone into your PC with USB, accept the debugging prompt, then click below.</p>' +
-    '<div class="btn-group"><button class="btn primary" onclick="doUSB()" style="flex:1">Enable Wireless via USB</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="doUSB()">Enable Wireless via USB</button></div>' +
     '<div class="output" id="usbOut">Ready</div>' +
     '</div>';
 
@@ -892,31 +1118,40 @@ views.connect = function(c) {
     '<div class="fg"><label>Phone IP</label><input id="pIP" placeholder="192.168.1.42"></div>' +
     '<div class="fg"><label>Pairing Port</label><input id="pPort" placeholder="37861"></div>' +
     '<div class="fg"><label>6-Digit Pairing Code</label><input id="pCode" placeholder="482916" maxlength="6"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="doPair()" style="flex:1">Pair Device</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="doPair()">Pair Device</button></div>' +
     '<div class="fg" style="margin-top:14px"><label>Connect Port (from Wireless Debugging screen)</label><input id="cPort" placeholder="5555"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="doConn()" style="flex:1">Connect Wireless</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="doConn()">Connect Wireless</button></div>' +
     '<div class="output" id="pairOut">Ready</div>' +
     '</div>';
   c.innerHTML = html;
 };
 
 async function doQRPair() {
-  var box = document.getElementById('qrStatusBox');
-  box.innerHTML = '<div class="qr-status waiting"><div class="spinner"></div><span>Opening QR terminal...</span></div>';
-  log('Opening QR pairing terminal...', 'info');
+  var container = document.getElementById('qrContainer');
+  var btn = document.getElementById('qrStartBtn');
+  container.innerHTML = '<div class="qr-status waiting"><div class="spinner"></div><span>Generating QR code...</span></div>';
+  btn.disabled = true;
+  log('Starting QR pairing session...', 'info');
+
   try {
     var res = await api('/api/qr/start', { method: 'POST' });
     if (!res.success) {
-      box.innerHTML = '<div class="qr-status error"><span>❌ ' + (res.output || 'Failed to open terminal') + '</span></div>';
-      log('QR start failed: ' + (res.output || 'unknown'), 'error');
+      container.innerHTML = '<div class="qr-status error"><span>❌ ' + (res.output || 'Failed') + '</span></div>';
+      btn.disabled = false;
       return;
     }
-    box.innerHTML = '<div class="qr-status waiting"><div class="spinner"></div><span>📱 Scan the QR code in the terminal window with your phone...</span></div>';
-    log('QR terminal opened — waiting for scan', 'info');
+    container.innerHTML =
+      '<div class="qr-wrapper">' +
+        '<img src="' + res.qr + '" alt="Scan with phone">' +
+        '<div class="qr-instructions">📷 Scan this QR code with your phone</div>' +
+        '<div class="qr-payload">Service: ' + res.service_name + '</div>' +
+      '</div>' +
+      '<div class="qr-status waiting" id="qrStat"><div class="spinner"></div><span>Waiting for phone to connect...</span></div>';
+    log('QR generated — scan with your phone', 'info');
     startQRPolling();
   } catch (e) {
-    box.innerHTML = '<div class="qr-status error"><span>❌ ' + e.message + '</span></div>';
-    log('QR error: ' + e.message, 'error');
+    container.innerHTML = '<div class="qr-status error"><span>❌ ' + e.message + '</span></div>';
+    btn.disabled = false;
   }
 }
 
@@ -924,14 +1159,17 @@ function startQRPolling() {
   if (qrPollTimer) clearInterval(qrPollTimer);
   var elapsed = 0;
   qrPollTimer = setInterval(async function() {
-    elapsed += 3;
+    elapsed += 2;
     try {
       var res = await api('/api/qr/poll');
-      if (res.connected && res.device) {
+      if (res.paired && res.device) {
         clearInterval(qrPollTimer);
         qrPollTimer = null;
-        var box = document.getElementById('qrStatusBox');
-        if (box) box.innerHTML = '<div class="qr-status success"><span>✅ Connected! Device: ' + res.device + '</span></div>';
+        var stat = document.getElementById('qrStat');
+        if (stat) {
+          stat.className = 'qr-status success';
+          stat.innerHTML = '<span>✅ Connected! Device: ' + res.device + '</span>';
+        }
         log('QR pairing successful: ' + res.device, 'success');
         await refreshDevs();
         setTimeout(function() {
@@ -940,16 +1178,32 @@ function startQRPolling() {
             sel.selectedIndex = 0;
             selDev();
           }
+          var btn = document.getElementById('qrStartBtn');
+          if (btn) btn.disabled = false;
         }, 500);
+      } else if (res.error) {
+        clearInterval(qrPollTimer);
+        qrPollTimer = null;
+        var stat2 = document.getElementById('qrStat');
+        if (stat2) {
+          stat2.className = 'qr-status error';
+          stat2.innerHTML = '<span>❌ ' + res.error + '</span>';
+        }
+        var btn2 = document.getElementById('qrStartBtn');
+        if (btn2) btn2.disabled = false;
       } else if (elapsed > 180) {
         clearInterval(qrPollTimer);
         qrPollTimer = null;
-        var box2 = document.getElementById('qrStatusBox');
-        if (box2) box2.innerHTML = '<div class="qr-status error"><span>⏱ Timeout — no device connected</span></div>';
-        log('QR pairing timed out', 'warn');
+        var stat3 = document.getElementById('qrStat');
+        if (stat3) {
+          stat3.className = 'qr-status error';
+          stat3.innerHTML = '<span>⏱ Timeout — no phone detected</span>';
+        }
+        var btn3 = document.getElementById('qrStartBtn');
+        if (btn3) btn3.disabled = false;
       }
     } catch (e) { }
-  }, 3000);
+  }, 2000);
 }
 
 async function doUSB() {
@@ -1009,7 +1263,7 @@ views.device = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>Device Information</h3>' +
     '<div class="btn-group">' +
-    '<button class="btn primary" onclick="getInfo()" style="flex:1">Fetch Info</button>' +
+    '<button class="btn primary" onclick="getInfo()">Fetch Info</button>' +
     '<button class="btn" onclick="getScrn()">Screenshot</button>' +
     '</div>' +
     '<div class="output" id="infoOut">Click Fetch Info</div>' +
@@ -1047,7 +1301,7 @@ views.apk = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>APK Static Analyzer</h3>' +
     '<div class="fg"><label>APK File Path</label><input id="apkPath" placeholder="/path/to/app.apk"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="anaAPK()" style="flex:1">Analyze APK</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="anaAPK()">Analyze APK</button></div>' +
     '<div class="output" id="apkOut">Ready</div>' +
     '</div>';
 };
@@ -1106,7 +1360,7 @@ views.network = function(c) {
     '<div class="fg"><label>Target IP / Host</label><input id="tarIP" placeholder="192.168.1.1"></div>' +
     '<div class="btn-group">' +
     '<button class="btn" onclick="useDevIP()">Use Device IP</button>' +
-    '<button class="btn primary" onclick="scanPorts()" style="flex:1">Scan Ports</button>' +
+    '<button class="btn primary" onclick="scanPorts()">Scan Ports</button>' +
     '</div>' +
     '<div class="output" id="scanOut">Ready</div>' +
     '</div>';
@@ -1150,7 +1404,7 @@ views.vuln = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>Vulnerability Scanner</h3>' +
     '<div class="btn-group">' +
-    '<button class="btn primary" onclick="vulnScan()" style="flex:1">Full Scan</button>' +
+    '<button class="btn primary" onclick="vulnScan()">Full Scan</button>' +
     '<button class="btn" onclick="checkRoot()">Root Check</button>' +
     '<button class="btn" onclick="checkCVE()">CVE Check</button>' +
     '</div>' +
@@ -1210,7 +1464,7 @@ views.payload = function(c) {
     '<h3>Reverse Shell Payloads</h3>' +
     '<div class="fg"><label>LHOST (your IP)</label><input id="lh" value="10.0.0.1"></div>' +
     '<div class="fg"><label>LPORT (your port)</label><input id="lp" value="4444"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="genPay()" style="flex:1">Generate</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="genPay()">Generate</button></div>' +
     '<div class="output" id="payOut">Ready</div>' +
     '</div>';
 };
@@ -1236,7 +1490,7 @@ views.report = function(c) {
     '<h3>Report Generator</h3>' +
     '<div class="fg"><label>Target Name</label><input id="tarName" value="Unknown"></div>' +
     '<div class="btn-group">' +
-    '<button class="btn primary" onclick="genRep()" style="flex:1">Generate Report</button>' +
+    '<button class="btn primary" onclick="genRep()">Generate Report</button>' +
     '<button class="btn" onclick="clrSess()">Clear Session</button>' +
     '</div>' +
     '<div class="output" id="repOut">Ready</div>' +
@@ -1264,7 +1518,7 @@ views.logcat = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>Logcat Analyzer</h3>' +
     '<div class="fg"><label>Lines to Capture</label><input id="lcLines" value="300"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="capLog()" style="flex:1">Capture</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="capLog()">Capture</button></div>' +
     '<div class="output" id="lcOut">Ready</div>' +
     '</div>';
 };
@@ -1288,7 +1542,7 @@ async function capLog() {
 views.screenshot = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>Screenshot</h3>' +
-    '<div class="btn-group"><button class="btn primary" onclick="getScrn()" style="flex:1">Capture Screenshot</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="getScrn()">Capture Screenshot</button></div>' +
     '<div class="output" id="scrOut">Ready</div>' +
     '</div>';
 };
@@ -1297,7 +1551,7 @@ views.packages = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>Package Manager</h3>' +
     '<div class="fg"><label>Filter</label><input id="pkFilter" value="third_party"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="lstPkg()" style="flex:1">List Packages</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="lstPkg()">List Packages</button></div>' +
     '<div class="output" id="pkOut">Ready</div>' +
     '</div>';
 };
@@ -1323,13 +1577,13 @@ views.files = function(c) {
     '<h3>Pull File from Device</h3>' +
     '<div class="fg"><label>Remote Path</label><input id="remPath" placeholder="/sdcard/file.txt"></div>' +
     '<div class="fg"><label>Local Destination</label><input id="locPath" value="output"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="doPull()" style="flex:1">Pull</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="doPull()">Pull</button></div>' +
     '</div>';
   html += '<div class="card">' +
     '<h3>Push File to Device</h3>' +
     '<div class="fg"><label>Local File</label><input id="locPush" placeholder="/path/to/file"></div>' +
     '<div class="fg"><label>Remote Destination</label><input id="remPush" value="/sdcard/"></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="doPush()" style="flex:1">Push</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="doPush()">Push</button></div>' +
     '</div>';
   html += '<div class="output" id="fileOut">Ready</div>';
   c.innerHTML = html;
@@ -1367,7 +1621,7 @@ views.shell = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>ADB Shell</h3>' +
     '<div class="fg"><label>Command</label><input id="shCmd" placeholder="id, ls /sdcard, getprop..."></div>' +
-    '<div class="btn-group"><button class="btn primary" onclick="runShell()" style="flex:1">Execute</button></div>' +
+    '<div class="btn-group"><button class="btn primary" onclick="runShell()">Execute</button></div>' +
     '<div class="output" id="shOut">Ready</div>' +
     '</div>';
 };
@@ -1389,8 +1643,8 @@ async function runShell() {
 views.remote = function(c) {
   c.innerHTML = '<div class="card">' +
     '<h3>Remote Control (scrcpy)</h3>' +
-    '<p>Requires scrcpy installed on your system.</p>' +
-    '<div class="btn-group"><button class="btn primary" onclick="doScrcpy()" style="flex:1">Launch Screen</button></div>' +
+    '<p>Requires scrcpy installed on your system. Not available in Termux.</p>' +
+    '<div class="btn-group"><button class="btn primary" onclick="doScrcpy()">Launch Screen</button></div>' +
     '<div class="output" id="rmOut">Ready</div>' +
     '</div>';
 };
@@ -1411,10 +1665,10 @@ views.about = function(c) {
     '<h3>About DANIYAL KHAN PRO</h3>' +
     '<table style="width:100%;font-size:13px;line-height:2">' +
     '<tr><td style="color:var(--accent);font-weight:600;width:140px">Tool</td><td>DANIYAL KHAN PRO</td></tr>' +
-    '<tr><td style="color:var(--accent);font-weight:600">Version</td><td>10.1.0</td></tr>' +
+    '<tr><td style="color:var(--accent);font-weight:600">Version</td><td>11.0.0</td></tr>' +
     '<tr><td style="color:var(--accent);font-weight:600">Author</td><td>DANIYAL KHAN</td></tr>' +
     '<tr><td style="color:var(--accent);font-weight:600">Instagram</td><td>@hexsecteam</td></tr>' +
-    '<tr><td style="color:var(--accent);font-weight:600">Platform</td><td>Kali Linux / Windows / macOS</td></tr>' +
+    '<tr><td style="color:var(--accent);font-weight:600">Platform</td><td>Kali Linux / Termux / Windows / macOS</td></tr>' +
     '</table>' +
     '<p style="margin-top:16px;color:var(--dim);font-size:12px">For authorized security testing only.</p>' +
     '</div>';
@@ -1435,12 +1689,18 @@ window.addEventListener('DOMContentLoaded', function() {
       } else {
         st.textContent = 'ADB Not Found';
         st.parentElement.style.color = '#ff6b6b';
+        var dot = document.getElementById('mobStatusDot');
+        if (dot) { dot.style.background = '#ff6b6b'; }
       }
     })
     .catch(function() {});
 
-  log('DANIYAL KHAN PRO v10.1.0 initialized', 'success');
+  log('DANIYAL KHAN PRO v11.0.0 initialized', 'success');
   log('Select Connect Device to pair your phone', 'info');
+});
+
+window.addEventListener('resize', function() {
+  isMobile = window.matchMedia('(max-width: 900px)').matches;
 });
 </script>
 </body>
@@ -1460,7 +1720,8 @@ def index():
 def api_version():
     ok, info = check_adb()
     return jsonify({"adb_available": ok, "adb_info": info,
-                    "version": VERSION, "system": SYSTEM})
+                    "version": VERSION, "system": SYSTEM,
+                    "termux": IS_TERMUX})
 
 @app.route("/api/devices")
 def api_devices():
@@ -1480,25 +1741,40 @@ def api_connect():
     d = request.json or {}
     return jsonify(do_connect(d.get("ip", ""), d.get("port", "5555")))
 
+# ─── QR ROUTES (in-browser) ────────────────────────────────────────────────
+
 @app.route("/api/qr/start", methods=["POST"])
 def api_qr_start():
-    """Open a new terminal window with the QR code for pairing."""
+    """Generate QR + start mDNS listener + auto-pair."""
     try:
-        ok, msg = fix_mdns()
+        start_qr_pairing_session()
+        return jsonify({
+            "success": True,
+            "qr": _QR["qr_base64"],
+            "service_name": _QR["service_name"],
+        })
     except Exception as e:
-        print("[QR] mdns fix error:", e)
-    time.sleep(0.5)
-    ok, msg = open_qr_terminal()
-    return jsonify({"success": ok, "output": msg})
+        return jsonify({"success": False, "output": str(e)})
 
 @app.route("/api/qr/poll")
 def api_qr_poll():
-    """Check if a device has connected after QR scan."""
+    """Check QR pairing status."""
+    if _QR["paired"]:
+        return jsonify({"paired": True, "device": _QR["paired_device"]})
+    if _QR["error"]:
+        return jsonify({"paired": False, "error": _QR["error"]})
+    if _QR["active"]:
+        return jsonify({"paired": False, "active": True})
+    # fallback — check if device appeared anyway
     devs = list_devices()
     if devs:
-        return jsonify({"connected": True, "device": devs[0]["serial"],
-                        "model": devs[0]["model"]})
-    return jsonify({"connected": False})
+        return jsonify({"paired": True, "device": devs[0]["serial"]})
+    return jsonify({"paired": False})
+
+@app.route("/api/qr/cancel", methods=["POST"])
+def api_qr_cancel():
+    _QR["active"] = False
+    return jsonify({"success": True})
 
 @app.route("/api/device/<d>/info")
 def api_dev_info(d):
@@ -1624,7 +1900,7 @@ def api_clear():
 @app.route("/api/device/<d>/scrcpy", methods=["POST"])
 def api_scrcpy(d):
     if not tool_exists("scrcpy"):
-        return jsonify({"error": "scrcpy not installed. Install: sudo apt install scrcpy"}), 400
+        return jsonify({"error": "scrcpy not installed"}), 400
     try:
         subprocess.Popen(["scrcpy", "-s", d, "--window-title", "DANIYAL KHAN Remote"])
         return jsonify({"success": True})
@@ -1639,7 +1915,7 @@ def api_scrcpy(d):
 def open_browser():
     time.sleep(1.5)
     try:
-        webbrowser.open("http://" + HOST + ":" + str(PORT))
+        webbrowser.open("http://" + ("127.0.0.1" if not IS_TERMUX else "127.0.0.1") + ":" + str(PORT))
     except Exception:
         pass
 
@@ -1650,19 +1926,17 @@ if __name__ == "__main__":
     print(" " * 22 + "DANIYAL KHAN PRO v" + VERSION)
     print(" " * 14 + "Professional Android Pentesting Framework")
     print("=" * 78)
-    print("  System  : " + SYSTEM)
+    print("  System  : " + SYSTEM + (" (Termux)" if IS_TERMUX else ""))
     print("  Author  : " + AUTHOR + " | Instagram: " + INSTAGRAM)
     ok, info = check_adb()
     print("  ADB     : " + ("READY — " + info if ok else "NOT FOUND"))
     if not ok:
-        print("            Linux  : sudo apt install android-tools-adb")
-        print("            Windows: install platform-tools from developer.android.com")
-    qr = find_qr_tool()
-    print("  QR Tool : " + (qr if qr else "NOT FOUND — install: pip install adb-wifi-qr"))
-    print("  Web UI  : http://" + HOST + ":" + str(PORT))
-    print("=" * 78)
-    print("  Browser will open automatically...")
-    print("  Press Ctrl+C to stop")
+        print("            Kali    : sudo apt install android-tools-adb")
+        print("            Termux  : pkg install android-tools")
+        print("            Windows : install platform-tools from developer.android.com")
+    print("  Web UI  : http://127.0.0.1:" + str(PORT))
+    if IS_TERMUX:
+        print("  Open this URL in your Android browser to see the QR code")
     print("=" * 78)
     threading.Thread(target=open_browser, daemon=True).start()
     try:
